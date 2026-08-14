@@ -68,6 +68,7 @@ func TestMain(m *testing.M) {
 	// the rest of the suite hermetic.
 	testHandler.WebhookRateLimiter = NewMemoryWebhookRateLimiter(WebhookRateLimit{Limit: 1_000_000, Window: time.Minute})
 	testHandler.WebhookIPRateLimiter = NewMemoryWebhookIPRateLimiter(WebhookRateLimit{Limit: 1_000_000, Window: time.Minute})
+	testHandler.WebhookAbsoluteIPRateLimiter = NewMemoryWebhookAbsoluteIPRateLimiter(WebhookRateLimit{Limit: 1_000_000, Window: time.Minute})
 	testPool = pool
 
 	testUserID, testWorkspaceID, err = setupHandlerTestFixture(ctx, pool)
@@ -121,22 +122,33 @@ func setupHandlerTestFixture(ctx context.Context, pool *pgxpool.Pool) (string, s
 	var runtimeID string
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO agent_runtime (
-			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at
+			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, owner_id, last_seen_at
 		)
-		VALUES ($1, NULL, $2, 'cloud', $3, 'online', $4, '{}'::jsonb, now())
+		VALUES ($1, NULL, $2, 'cloud', $3, 'online', $4, '{}'::jsonb, $5, now())
 		RETURNING id
-	`, workspaceID, "Handler Test Runtime", "handler_test_runtime", "Handler test runtime").Scan(&runtimeID); err != nil {
+	`, workspaceID, "Handler Test Runtime", "handler_test_runtime", "Handler test runtime", userID).Scan(&runtimeID); err != nil {
 		return "", "", err
 	}
 	testRuntimeID = runtimeID
 
-	if _, err := pool.Exec(ctx, `
+	var seededAgentID string
+	if err := pool.QueryRow(ctx, `
 		INSERT INTO agent (
 			workspace_id, name, description, runtime_mode, runtime_config,
-			runtime_id, visibility, max_concurrent_tasks, owner_id
+			runtime_id, visibility, permission_mode, max_concurrent_tasks, owner_id
 		)
-		VALUES ($1, $2, '', 'cloud', '{}'::jsonb, $3, 'workspace', 1, $4)
-	`, workspaceID, "Handler Test Agent", runtimeID, userID); err != nil {
+		VALUES ($1, $2, '', 'cloud', '{}'::jsonb, $3, 'workspace', 'public_to', 1, $4)
+		RETURNING id
+	`, workspaceID, "Handler Test Agent", runtimeID, userID).Scan(&seededAgentID); err != nil {
+		return "", "", err
+	}
+	// MUL-3963: the seeded workspace-visible agent is invocable by workspace
+	// members and A2A triggers, so seed its workspace invocation target.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO agent_invocation_target (agent_id, target_type, target_id)
+		VALUES ($1, 'workspace', $2)
+		ON CONFLICT (agent_id, target_type, target_id) DO NOTHING
+	`, seededAgentID, workspaceID); err != nil {
 		return "", "", err
 	}
 
@@ -144,6 +156,15 @@ func setupHandlerTestFixture(ctx context.Context, pool *pgxpool.Pool) (string, s
 }
 
 func cleanupHandlerTestFixture(ctx context.Context, pool *pgxpool.Pool) error {
+	var hasClientUsageTable bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('client_usage_daily') IS NOT NULL`).Scan(&hasClientUsageTable); err != nil {
+		return err
+	}
+	if hasClientUsageTable {
+		if _, err := pool.Exec(ctx, `DELETE FROM client_usage_daily WHERE user_id IN (SELECT id FROM "user" WHERE email = $1)`, handlerTestEmail); err != nil {
+			return err
+		}
+	}
 	if _, err := pool.Exec(ctx, `DELETE FROM workspace WHERE slug = $1`, handlerTestWorkspaceSlug); err != nil {
 		return err
 	}
@@ -171,6 +192,22 @@ func withURLParam(req *http.Request, key, value string) *http.Request {
 	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 }
 
+func setWorkspaceIssuePrefixForTest(t *testing.T, prefix string) {
+	t.Helper()
+
+	ctx := context.Background()
+	var previous string
+	if err := testPool.QueryRow(ctx, `SELECT issue_prefix FROM workspace WHERE id = $1`, testWorkspaceID).Scan(&previous); err != nil {
+		t.Fatalf("load workspace prefix: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE workspace SET issue_prefix = $1 WHERE id = $2`, prefix, testWorkspaceID); err != nil {
+		t.Fatalf("set workspace prefix: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `UPDATE workspace SET issue_prefix = $1 WHERE id = $2`, previous, testWorkspaceID)
+	})
+}
+
 func handlerTestRuntimeID(t *testing.T) string {
 	t.Helper()
 
@@ -192,13 +229,25 @@ func createHandlerTestAgent(t *testing.T, name string, mcpConfig []byte) string 
 	if err := testPool.QueryRow(context.Background(), `
 		INSERT INTO agent (
 			workspace_id, name, description, runtime_mode, runtime_config,
-			runtime_id, visibility, max_concurrent_tasks, owner_id,
+			runtime_id, visibility, permission_mode, max_concurrent_tasks, owner_id,
 			instructions, custom_env, custom_args, mcp_config
 		)
-		VALUES ($1, $2, '', 'cloud', '{}'::jsonb, $3, 'private', 1, $4, '', '{}'::jsonb, '[]'::jsonb, $5)
+		VALUES ($1, $2, '', 'cloud', '{}'::jsonb, $3, 'workspace', 'public_to', 1, $4, '', '{}'::jsonb, '[]'::jsonb, $5)
 		RETURNING id
 	`, testWorkspaceID, name, handlerTestRuntimeID(t), testUserID, mcpConfig).Scan(&agentID); err != nil {
 		t.Fatalf("failed to create handler test agent: %v", err)
+	}
+	// Generic test agents are workspace-invocable (MUL-3963): seed the
+	// matching workspace invocation target so canInvokeAgent admits workspace
+	// members and A2A triggers, mirroring the pre-permission-model behavior
+	// where a workspace-visible agent could be triggered by anyone in the
+	// workspace. Dedicated private-agent tests use privateAgentTestFixture.
+	if _, err := testPool.Exec(context.Background(), `
+		INSERT INTO agent_invocation_target (agent_id, target_type, target_id)
+		VALUES ($1, 'workspace', $2)
+		ON CONFLICT (agent_id, target_type, target_id) DO NOTHING
+	`, agentID, testWorkspaceID); err != nil {
+		t.Fatalf("failed to seed workspace invocation target: %v", err)
 	}
 
 	t.Cleanup(func() {
@@ -457,6 +506,60 @@ func TestDeleteIssueByIdentifier(t *testing.T) {
 	}
 }
 
+// TestGetIssueByIdentifierEnforcesPrefix covers the contract behind the
+// human-readable issue URL `/{ws}/issues/{key}`: the prefix is part of the key,
+// not decoration. Identifier resolution used to compare the number only, so
+// every prefix with the right number opened the same issue — which means no
+// identifier URL could be treated as canonical, and a mistyped or stale prefix
+// silently opened someone else's link target.
+func TestGetIssueByIdentifierEnforcesPrefix(t *testing.T) {
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":    "Issue addressed by identifier",
+		"status":   "todo",
+		"priority": "medium",
+	})
+	testHandler.CreateIssue(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var created IssueResponse
+	json.NewDecoder(w.Body).Decode(&created)
+
+	idx := strings.LastIndex(created.Identifier, "-")
+	if idx <= 0 {
+		t.Fatalf("CreateIssue: unexpected identifier %q", created.Identifier)
+	}
+	prefix, number := created.Identifier[:idx], created.Identifier[idx+1:]
+
+	// The workspace's own prefix resolves, in either case — a hand-typed
+	// lowercase key from a chat message must open the same issue.
+	for _, id := range []string{created.Identifier, strings.ToLower(created.Identifier)} {
+		w = httptest.NewRecorder()
+		req = newRequest("GET", "/api/issues/"+id, nil)
+		req = withURLParam(req, "id", id)
+		testHandler.GetIssue(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("GetIssue(%q): expected 200, got %d: %s", id, w.Code, w.Body.String())
+		}
+		var got IssueResponse
+		json.NewDecoder(w.Body).Decode(&got)
+		if got.ID != created.ID {
+			t.Fatalf("GetIssue(%q): resolved to %s, want %s", id, got.ID, created.ID)
+		}
+	}
+
+	// A foreign prefix carrying the right number must not resolve.
+	foreign := prefix + "X-" + number
+	w = httptest.NewRecorder()
+	req = newRequest("GET", "/api/issues/"+foreign, nil)
+	req = withURLParam(req, "id", foreign)
+	testHandler.GetIssue(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("GetIssue(%q): expected 404 for a foreign prefix, got %d: %s", foreign, w.Code, w.Body.String())
+	}
+}
+
 // TestDeleteIssueRejectsInvalidUUID verifies that a path segment that is
 // neither a valid UUID nor a valid identifier returns 404 (not 204) — the
 // handler must never silently succeed on malformed input.
@@ -521,6 +624,115 @@ func TestCreateIssueExplicitBacklogPreserved(t *testing.T) {
 	cleanupReq := newRequest("DELETE", "/api/issues/"+created.ID, nil)
 	cleanupReq = withURLParam(cleanupReq, "id", created.ID)
 	testHandler.DeleteIssue(httptest.NewRecorder(), cleanupReq)
+}
+
+// TestCreateIssueRejectsCrossWorkspaceParent guards the workspace
+// boundary check that lives in service.IssueService.Create. A request
+// that pins parent_issue_id to an issue in a foreign workspace must be
+// rejected before the row is created — this is the structural reason
+// IssueService owns the parent lookup (not the HTTP handler). The test
+// inserts a foreign workspace + issue directly via SQL, then drives the
+// request through the regular handler entry point.
+func TestCreateIssueRejectsCrossWorkspaceParent(t *testing.T) {
+	ctx := context.Background()
+
+	var otherWorkspaceID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO workspace (name, slug, description, issue_prefix)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id
+	`, "Cross-workspace parent test", "xwp-parent-test", "Foreign workspace", "XWP").Scan(&otherWorkspaceID); err != nil {
+		t.Fatalf("insert foreign workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM workspace WHERE id = $1`, otherWorkspaceID)
+	})
+
+	var foreignParentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number)
+		VALUES ($1, $2, 'todo', 'none', 'member', $3, 1)
+		RETURNING id
+	`, otherWorkspaceID, "Foreign parent", testUserID).Scan(&foreignParentID); err != nil {
+		t.Fatalf("insert foreign parent: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":           "Should be rejected",
+		"parent_issue_id": foreignParentID,
+	})
+	testHandler.CreateIssue(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("CreateIssue with foreign parent: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "parent issue not found in this workspace") {
+		t.Fatalf("CreateIssue with foreign parent: expected boundary error message, got %s", w.Body.String())
+	}
+
+	var count int
+	if err := testPool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM issue WHERE workspace_id = $1 AND title = $2`,
+		testWorkspaceID, "Should be rejected",
+	).Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("rejected create still wrote a row (count=%d) — service-layer boundary check failed", count)
+	}
+}
+
+// TestCreateIssueRejectsCrossWorkspaceProject mirrors the parent test for
+// the project workspace boundary. Same reasoning: future create entries
+// (Lark /issue, MCP, API keys) must inherit this guard from the service
+// without re-implementing it.
+func TestCreateIssueRejectsCrossWorkspaceProject(t *testing.T) {
+	ctx := context.Background()
+
+	var otherWorkspaceID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO workspace (name, slug, description, issue_prefix)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id
+	`, "Cross-workspace project test", "xwp-project-test", "Foreign workspace", "XWP").Scan(&otherWorkspaceID); err != nil {
+		t.Fatalf("insert foreign workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM workspace WHERE id = $1`, otherWorkspaceID)
+	})
+
+	var foreignProjectID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO project (workspace_id, title, status, priority)
+		VALUES ($1, $2, 'planned', 'none')
+		RETURNING id
+	`, otherWorkspaceID, "Foreign project").Scan(&foreignProjectID); err != nil {
+		t.Fatalf("insert foreign project: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":      "Should be rejected",
+		"project_id": foreignProjectID,
+	})
+	testHandler.CreateIssue(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("CreateIssue with foreign project: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "project not found in this workspace") {
+		t.Fatalf("CreateIssue with foreign project: expected boundary error message, got %s", w.Body.String())
+	}
+
+	var count int
+	if err := testPool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM issue WHERE workspace_id = $1 AND title = $2`,
+		testWorkspaceID, "Should be rejected",
+	).Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("rejected create still wrote a row (count=%d) — service-layer boundary check failed", count)
+	}
 }
 
 func TestCreateSubIssueInheritsParentProject(t *testing.T) {
@@ -1214,6 +1426,101 @@ func TestAutopilotCreateIssueAssociatesConfiguredProject(t *testing.T) {
 	}
 }
 
+func TestAutopilotDispatchUsesCurrentProjectBinding(t *testing.T) {
+	ctx := context.Background()
+	title := fmt.Sprintf("Autopilot stale project issue %d", time.Now().UnixNano())
+	var autopilotID, issueID, projectAID, projectBID string
+	defer func() {
+		if issueID != "" {
+			testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID)
+		}
+		if autopilotID != "" {
+			testPool.Exec(ctx, `DELETE FROM autopilot WHERE id = $1`, autopilotID)
+		}
+		if projectAID != "" {
+			testPool.Exec(ctx, `DELETE FROM project WHERE id = $1`, projectAID)
+		}
+		if projectBID != "" {
+			testPool.Exec(ctx, `DELETE FROM project WHERE id = $1`, projectBID)
+		}
+	}()
+
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO project (workspace_id, title)
+		VALUES ($1, $2)
+		RETURNING id::text
+	`, testWorkspaceID, "Autopilot stale project A").Scan(&projectAID); err != nil {
+		t.Fatalf("create project A fixture: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO project (workspace_id, title)
+		VALUES ($1, $2)
+		RETURNING id::text
+	`, testWorkspaceID, "Autopilot stale project B").Scan(&projectBID); err != nil {
+		t.Fatalf("create project B fixture: %v", err)
+	}
+
+	var agentID string
+	if err := testPool.QueryRow(ctx, `SELECT id FROM agent WHERE workspace_id = $1 LIMIT 1`, testWorkspaceID).Scan(&agentID); err != nil {
+		t.Fatalf("load test agent: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/autopilots?workspace_id="+testWorkspaceID, map[string]any{
+		"title":                "Stale-project autopilot",
+		"assignee_id":          agentID,
+		"execution_mode":       "create_issue",
+		"issue_title_template": title,
+		"project_id":           projectAID,
+	})
+	testHandler.CreateAutopilot(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateAutopilot: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var created AutopilotResponse
+	if err := json.NewDecoder(w.Body).Decode(&created); err != nil {
+		t.Fatalf("decode autopilot: %v", err)
+	}
+	autopilotID = created.ID
+
+	queries := db.New(testPool)
+	ap, err := queries.GetAutopilot(ctx, parseUUID(autopilotID))
+	if err != nil {
+		t.Fatalf("GetAutopilot: %v", err)
+	}
+
+	w = httptest.NewRecorder()
+	req = newRequest("PATCH", "/api/autopilots/"+autopilotID+"?workspace_id="+testWorkspaceID, map[string]any{
+		"project_id": projectBID,
+	})
+	req = withURLParam(req, "id", autopilotID)
+	testHandler.UpdateAutopilot(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("UpdateAutopilot: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	run, err := testHandler.AutopilotService.DispatchAutopilot(ctx, ap, pgtype.UUID{}, "manual", nil)
+	if err != nil {
+		t.Fatalf("DispatchAutopilot: %v", err)
+	}
+	if run == nil || !run.IssueID.Valid {
+		t.Fatalf("dispatch run = %+v, want linked issue", run)
+	}
+	issueID = uuidToString(run.IssueID)
+
+	var issueProjectID *string
+	if err := testPool.QueryRow(ctx, `
+		SELECT project_id::text
+		FROM issue
+		WHERE id = $1
+	`, issueID).Scan(&issueProjectID); err != nil {
+		t.Fatalf("load created issue project: %v", err)
+	}
+	if issueProjectID == nil || *issueProjectID != projectBID {
+		t.Fatalf("created issue project_id = %v, want refreshed %q", issueProjectID, projectBID)
+	}
+}
+
 func TestUpdateAutopilotCanSetAndClearProject(t *testing.T) {
 	ctx := context.Background()
 	var autopilotID, projectID string
@@ -1577,6 +1884,78 @@ func TestCommentCRUD(t *testing.T) {
 	testHandler.DeleteIssue(w, req)
 }
 
+func TestCommentWritePathsPreserveIssueIdentifiers(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("requires DB")
+	}
+
+	ctx := context.Background()
+	setWorkspaceIssuePrefixForTest(t, "MUL")
+
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, creator_type, creator_id, title, number)
+		VALUES ($1, 'member', $2, $3, 3310)
+		RETURNING id
+	`, testWorkspaceID, testUserID, "preserve bare issue identifiers").Scan(&issueID); err != nil {
+		t.Fatalf("create issue fixture: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID)
+	})
+
+	explicitMention := fmt.Sprintf("[MUL-3310](mention://issue/%s)", issueID)
+	createCases := []string{
+		"MUL-3310",
+		"issue/MUL-3310",
+		"feature/MUL-3310",
+		explicitMention,
+	}
+
+	var firstCommentID string
+	for _, content := range createCases {
+		w := httptest.NewRecorder()
+		req := newRequest("POST", "/api/issues/"+issueID+"/comments", map[string]any{
+			"content": content,
+		})
+		req = withURLParam(req, "id", issueID)
+		testHandler.CreateComment(w, req)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("CreateComment(%q): expected 201, got %d: %s", content, w.Code, w.Body.String())
+		}
+
+		var created CommentResponse
+		if err := json.NewDecoder(w.Body).Decode(&created); err != nil {
+			t.Fatalf("decode created comment: %v", err)
+		}
+		if created.Content != content {
+			t.Fatalf("CreateComment(%q) stored %q", content, created.Content)
+		}
+		if firstCommentID == "" {
+			firstCommentID = created.ID
+		}
+	}
+
+	updatedContent := "updated MUL-3310 issue/MUL-3310 feature/MUL-3310 " + explicitMention
+	w := httptest.NewRecorder()
+	req := newRequest("PUT", "/api/comments/"+firstCommentID, map[string]any{
+		"content": updatedContent,
+	})
+	req = withURLParam(req, "commentId", firstCommentID)
+	testHandler.UpdateComment(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("UpdateComment: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var updated CommentResponse
+	if err := json.NewDecoder(w.Body).Decode(&updated); err != nil {
+		t.Fatalf("decode updated comment: %v", err)
+	}
+	if updated.Content != updatedContent {
+		t.Fatalf("UpdateComment stored %q, want %q", updated.Content, updatedContent)
+	}
+}
+
 func TestCreateCommentRejectsMalformedParentID(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
@@ -1830,6 +2209,38 @@ func TestGetIssueGCCheckRejectsMalformedIssueID(t *testing.T) {
 	}
 }
 
+func TestBatchIssueGCCheckRejectsInvalidRequests(t *testing.T) {
+	h := &Handler{}
+	workspaceID := "00000000-0000-0000-0000-000000000001"
+	tooMany := make([]string, maxIssueGCBatchSize+1)
+	for i := range tooMany {
+		tooMany[i] = "00000000-0000-0000-0000-000000000002"
+	}
+
+	tests := []struct {
+		name        string
+		workspaceID string
+		body        any
+	}{
+		{name: "malformed workspace", workspaceID: "not-a-uuid", body: map[string]any{"issue_ids": []string{}}},
+		{name: "malformed issue", workspaceID: workspaceID, body: map[string]any{"issue_ids": []string{"not-a-uuid"}}},
+		{name: "too many issues", workspaceID: workspaceID, body: map[string]any{"issue_ids": tooMany}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req := newDaemonTokenRequest("POST", "/api/daemon/workspaces/"+tt.workspaceID+"/issues/gc-check", tt.body,
+				tt.workspaceID, "test-daemon")
+			req = withURLParam(req, "workspaceId", tt.workspaceID)
+			h.BatchIssueGCCheck(w, req)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
 func TestSetAgentSkillsRejectsMalformedSkillID(t *testing.T) {
 	agentID := createHandlerTestAgent(t, "Handler Malformed Skill Assignment", nil)
 
@@ -1841,6 +2252,145 @@ func TestSetAgentSkillsRejectsMalformedSkillID(t *testing.T) {
 	testHandler.SetAgentSkills(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("SetAgentSkills: expected 400 for malformed skill_ids, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAddAgentSkillsPreservesExistingAssignments(t *testing.T) {
+	agentID := createHandlerTestAgent(t, "Handler Add Skill Preserves Existing", nil)
+	existingSkillID := insertHandlerTestSkill(t, "add-preserve-existing", "existing body")
+	newSkillID := insertHandlerTestSkill(t, "add-preserve-new", "new body")
+
+	if _, err := testPool.Exec(context.Background(),
+		`INSERT INTO agent_skill (agent_id, skill_id) VALUES ($1, $2)`,
+		agentID, existingSkillID,
+	); err != nil {
+		t.Fatalf("seed existing skill assignment: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/agents/"+agentID+"/skills/add", map[string]any{
+		"skill_ids": []string{newSkillID},
+	})
+	req = withURLParam(req, "id", agentID)
+	testHandler.AddAgentSkills(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("AddAgentSkills: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp []SkillSummaryResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	assertSkillIDsPresent(t, resp, existingSkillID, newSkillID)
+	assertAgentSkillRowCount(t, agentID, 2)
+}
+
+func TestAddAgentSkillsAddsMultipleAndIsIdempotent(t *testing.T) {
+	agentID := createHandlerTestAgent(t, "Handler Add Multiple Skills", nil)
+	skillA := insertHandlerTestSkill(t, "add-multiple-a", "a body")
+	skillB := insertHandlerTestSkill(t, "add-multiple-b", "b body")
+
+	for attempt := 0; attempt < 2; attempt++ {
+		w := httptest.NewRecorder()
+		req := newRequest("POST", "/api/agents/"+agentID+"/skills/add", map[string]any{
+			"skill_ids": []string{skillA, skillB},
+		})
+		req = withURLParam(req, "id", agentID)
+		testHandler.AddAgentSkills(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("AddAgentSkills attempt %d: expected 200, got %d: %s", attempt+1, w.Code, w.Body.String())
+		}
+	}
+
+	assertAgentSkillRowCount(t, agentID, 2)
+}
+
+func TestAddAgentSkillsRejectsMalformedSkillID(t *testing.T) {
+	agentID := createHandlerTestAgent(t, "Handler Add Malformed Skill Assignment", nil)
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/agents/"+agentID+"/skills/add", map[string]any{
+		"skill_ids": []string{"not-a-uuid"},
+	})
+	req = withURLParam(req, "id", agentID)
+	testHandler.AddAgentSkills(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("AddAgentSkills: expected 400 for malformed skill_ids, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAddAgentSkillsRejectsCrossWorkspaceSkillID(t *testing.T) {
+	agentID := createHandlerTestAgent(t, "Handler Add Cross Workspace Skill", nil)
+	foreignSkillID := insertHandlerTestSkillInForeignWorkspace(t, "add-cross-workspace", "foreign body")
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/agents/"+agentID+"/skills/add", map[string]any{
+		"skill_ids": []string{foreignSkillID},
+	})
+	req = withURLParam(req, "id", agentID)
+	testHandler.AddAgentSkills(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("AddAgentSkills: expected 404 for cross-workspace skill_id, got %d: %s", w.Code, w.Body.String())
+	}
+	assertAgentSkillRowCount(t, agentID, 0)
+}
+
+func insertHandlerTestSkillInForeignWorkspace(t *testing.T, namePrefix, content string) string {
+	t.Helper()
+	ctx := context.Background()
+	slug := "foreign-skill-" + strings.ToLower(strings.ReplaceAll(t.Name(), "_", "-"))
+
+	var workspaceID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO workspace (name, slug, description, issue_prefix)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id
+	`, "Foreign Skill Workspace "+t.Name(), slug, "", "FSW").Scan(&workspaceID); err != nil {
+		t.Fatalf("insert foreign workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM workspace WHERE id = $1`, workspaceID)
+	})
+
+	name := namePrefix + "-" + t.Name()
+	var skillID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO skill (workspace_id, name, description, content, config, created_by)
+		VALUES ($1, $2, $3, $4, '{}'::jsonb, $5)
+		RETURNING id
+	`, workspaceID, name, "fixture", content, testUserID).Scan(&skillID); err != nil {
+		t.Fatalf("insert foreign skill: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM skill WHERE id = $1`, skillID)
+	})
+	return skillID
+}
+
+func assertSkillIDsPresent(t *testing.T, skills []SkillSummaryResponse, wantIDs ...string) {
+	t.Helper()
+	got := make(map[string]bool, len(skills))
+	for _, s := range skills {
+		got[s.ID] = true
+	}
+	for _, want := range wantIDs {
+		if !got[want] {
+			t.Fatalf("response missing skill %s; got %+v", want, skills)
+		}
+	}
+}
+
+func assertAgentSkillRowCount(t *testing.T, agentID string, want int) {
+	t.Helper()
+	var got int
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM agent_skill WHERE agent_id = $1`,
+		agentID,
+	).Scan(&got); err != nil {
+		t.Fatalf("count agent_skill: %v", err)
+	}
+	if got != want {
+		t.Fatalf("agent_skill row count: got %d, want %d", got, want)
 	}
 }
 
@@ -2848,6 +3398,171 @@ func TestBacklogToTodoByAgentSameAgentDifferentIssue(t *testing.T) {
 	}
 }
 
+// TestAssignIssueToSelfWithActiveTargetRunDoesNotDuplicate covers the direct
+// assignment form of #6947: an agent already working on an issue may claim its
+// ownership, but that ownership write must not enqueue a second run for the
+// same (issue, agent) pair.
+func TestAssignIssueToSelfWithActiveTargetRunDoesNotDuplicate(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	agentID := createHandlerTestAgent(t, "Self Assign Active Target", nil)
+
+	issue := createIssueForTest(t, map[string]any{"title": "self-assign active target", "status": "todo"})
+	runningTask := createHandlerTestTaskForAgentOnIssue(t, agentID, issue.ID)
+
+	previewRecorder := httptest.NewRecorder()
+	previewReq := newRequest("POST", "/api/issues/preview-trigger?workspace_id="+testWorkspaceID, map[string]any{
+		"issue_ids":     []string{issue.ID},
+		"assignee_type": "agent",
+		"assignee_id":   agentID,
+	})
+	previewReq.Header.Set("X-Agent-ID", agentID)
+	previewReq.Header.Set("X-Task-ID", runningTask)
+	testHandler.PreviewIssueTrigger(previewRecorder, previewReq)
+	if previewRecorder.Code != http.StatusOK {
+		t.Fatalf("PreviewIssueTrigger: expected 200, got %d: %s", previewRecorder.Code, previewRecorder.Body.String())
+	}
+	var preview IssueTriggerPreviewResponse
+	if err := json.NewDecoder(previewRecorder.Body).Decode(&preview); err != nil {
+		t.Fatalf("decode preview: %v", err)
+	}
+	if preview.TotalCount != 0 {
+		t.Fatalf("preview promised a duplicate self-assignment run: %+v", preview)
+	}
+
+	w := httptest.NewRecorder()
+	req := withURLParam(newRequest("PUT", "/api/issues/"+issue.ID, map[string]any{
+		"assignee_type": "agent",
+		"assignee_id":   agentID,
+	}), "id", issue.ID)
+	req.Header.Set("X-Agent-ID", agentID)
+	req.Header.Set("X-Task-ID", runningTask)
+	testHandler.UpdateIssue(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("UpdateIssue: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := queuedTaskCountFor(t, issue.ID, agentID); got != 0 {
+		t.Fatalf("self-assignment duplicated an active target run: got %d queued task(s)", got)
+	}
+	if got := taskStatus(t, runningTask); got != "running" {
+		t.Fatalf("existing target run must survive ownership claim, got status %q", got)
+	}
+}
+
+func TestShouldSuppressActiveSelfAssignmentFailsClosedOnLookupError(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	const agentID = "1c331d0b-94fd-412a-a7cc-6a209add00a1"
+	const issueID = "34c44eb2-bd85-455f-b47c-f39cc7b0b913"
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if !testHandler.shouldSuppressActiveSelfAssignment(
+		ctx,
+		"agent",
+		agentID,
+		parseUUID(issueID),
+		parseUUID(agentID),
+	) {
+		t.Fatal("lookup failure must fail closed and suppress duplicate enqueue")
+	}
+}
+
+// TestAssignDifferentIssueToSelfStillEnqueues locks in the intentional
+// cross-issue handoff behavior: an agent working on I1 may assign fresh I2 to
+// itself, and I2 still gets a queued run.
+func TestAssignDifferentIssueToSelfStillEnqueues(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	agentID := createHandlerTestAgent(t, "Cross Issue Self Assign", nil)
+	source := createIssueForTest(t, map[string]any{"title": "cross-issue source", "status": "todo"})
+	target := createIssueForTest(t, map[string]any{"title": "cross-issue target", "status": "todo"})
+	sourceTask := createHandlerTestTaskForAgentOnIssue(t, agentID, source.ID)
+
+	w := httptest.NewRecorder()
+	req := withURLParam(newRequest("PUT", "/api/issues/"+target.ID, map[string]any{
+		"assignee_type": "agent",
+		"assignee_id":   agentID,
+	}), "id", target.ID)
+	req.Header.Set("X-Agent-ID", agentID)
+	req.Header.Set("X-Task-ID", sourceTask)
+	testHandler.UpdateIssue(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("UpdateIssue: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := queuedTaskCountFor(t, target.ID, agentID); got != 1 {
+		t.Fatalf("cross-issue self-assignment should enqueue one run, got %d", got)
+	}
+}
+
+// TestBatchAssignFreshIssuesToSelfEnqueuesEach protects triage/autopilot
+// batches: being busy on a source issue is not a global self-assignment ban.
+// Every fresh target keeps the existing enqueue behavior.
+func TestBatchAssignFreshIssuesToSelfEnqueuesEach(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	agentID := createHandlerTestAgent(t, "Batch Fresh Self Assign", nil)
+	source := createIssueForTest(t, map[string]any{"title": "batch source", "status": "todo"})
+	target1 := createIssueForTest(t, map[string]any{"title": "batch target one", "status": "todo"})
+	target2 := createIssueForTest(t, map[string]any{"title": "batch target two", "status": "todo"})
+	sourceTask := createHandlerTestTaskForAgentOnIssue(t, agentID, source.ID)
+
+	w := httptest.NewRecorder()
+	req := newRequest("PATCH", "/api/issues/batch?workspace_id="+testWorkspaceID, map[string]any{
+		"issue_ids": []string{target1.ID, target2.ID},
+		"updates": map[string]any{
+			"assignee_type": "agent",
+			"assignee_id":   agentID,
+		},
+	})
+	req.Header.Set("X-Agent-ID", agentID)
+	req.Header.Set("X-Task-ID", sourceTask)
+	testHandler.BatchUpdateIssues(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("BatchUpdateIssues: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	for _, target := range []IssueResponse{target1, target2} {
+		if got := queuedTaskCountFor(t, target.ID, agentID); got != 1 {
+			t.Fatalf("fresh target %s should enqueue one run, got %d", target.ID, got)
+		}
+	}
+}
+
+// TestAssignActiveIssueToDifferentAgentStillEnqueues verifies the duplicate
+// guard never turns a real agent-to-agent transfer into an ownership-only
+// update. The old task survives per #4963 and the new assignee gets a run.
+func TestAssignActiveIssueToDifferentAgentStillEnqueues(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	actorAgent := createHandlerTestAgent(t, "Active Transfer Actor", nil)
+	targetAgent := createHandlerTestAgent(t, "Active Transfer Target", nil)
+	issue := createIssueForTest(t, map[string]any{"title": "active transfer", "status": "todo"})
+	actorTask := createHandlerTestTaskForAgentOnIssue(t, actorAgent, issue.ID)
+
+	w := httptest.NewRecorder()
+	req := withURLParam(newRequest("PUT", "/api/issues/"+issue.ID, map[string]any{
+		"assignee_type": "agent",
+		"assignee_id":   targetAgent,
+	}), "id", issue.ID)
+	req.Header.Set("X-Agent-ID", actorAgent)
+	req.Header.Set("X-Task-ID", actorTask)
+	testHandler.UpdateIssue(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("UpdateIssue: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := queuedTaskCountFor(t, issue.ID, targetAgent); got != 1 {
+		t.Fatalf("new assignee should get one queued run, got %d", got)
+	}
+	if got := taskStatus(t, actorTask); got != "running" {
+		t.Fatalf("old active task must survive transfer, got status %q", got)
+	}
+}
+
 // TestBatchBacklogToTodoByAgentTriggersAssignee mirrors the single-update
 // serial-chain test on the BatchUpdateIssues path. Earlier the
 // member-only gate would silently drop agent-driven batch promotions; the
@@ -2994,11 +3709,10 @@ func TestDaemonRegisterMissingWorkspaceReturns404(t *testing.T) {
 	}
 }
 
-// TestAgentReplyDoesNotInheritParentMentions verifies that agent-authored
-// replies do NOT inherit parent-comment mentions, preventing agent-to-agent
-// re-trigger loops (e.g. "No reply needed" chains). Member-authored replies
-// still inherit parent mentions as expected.
-func TestAgentReplyDoesNotInheritParentMentions(t *testing.T) {
+// TestRootMentionOwnerRoutesMemberReplyButNotAgentReply verifies that a member
+// root @mention owns later member replies, while agent-authored acknowledgments
+// still do not self-expand the route.
+func TestRootMentionOwnerRoutesMemberReplyButNotAgentReply(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
@@ -3082,7 +3796,7 @@ func TestAgentReplyDoesNotInheritParentMentions(t *testing.T) {
 	}
 
 	// 3. Agent A posts a reply in the same thread with NO mentions.
-	// With the fix, this must NOT inherit the parent mention of Agent B.
+	// Agent-authored comments still do not inherit the root mention of Agent B.
 	// resolveActor requires X-Task-ID paired with X-Agent-ID to trust the
 	// agent identity, so we seed a task that belongs to agent A.
 	agentATask := createHandlerTestTaskForAgent(t, agentA)
@@ -3101,7 +3815,7 @@ func TestAgentReplyDoesNotInheritParentMentions(t *testing.T) {
 	cancelTasks(agentB)
 
 	// 5. Member posts a reply in the same thread with NO mentions.
-	// This SHOULD inherit the parent mention and re-trigger Agent B.
+	// The member-authored root @mention owns the thread, so this routes to B.
 	w = postComment(issueID, map[string]any{
 		"content":   "Thanks for the review.",
 		"parent_id": parentComment.ID,
@@ -3110,7 +3824,7 @@ func TestAgentReplyDoesNotInheritParentMentions(t *testing.T) {
 		t.Fatalf("member reply: expected 201, got %d: %s", w.Code, w.Body.String())
 	}
 	if countTasks(agentB) != 1 {
-		t.Fatalf("expected 1 task for Agent B after member reply (parent inheritance allowed), got %d", countTasks(agentB))
+		t.Fatalf("expected 1 task for Agent B after member reply (root owner), got %d", countTasks(agentB))
 	}
 }
 
@@ -3210,10 +3924,10 @@ func TestMemberReplyToAgentRootDoesNotInheritParentMentions(t *testing.T) {
 	}
 }
 
-// TestNestedMemberReplyUsesDirectParentForMentionInheritance is the regression
+// TestNestedMemberReplyUsesDirectParentForThreadOwnership is the regression
 // for parent-root write normalization leaking root mentions into plain nested
-// replies. Stored parent_id keeps the direct parent, and trigger logic evaluates
-// that direct parent rather than the thread root.
+// replies. Stored parent_id keeps the direct parent, and trigger logic routes
+// to that direct agent parent rather than the thread root's explicit mention.
 func TestNestedMemberReplyUsesDirectParentForMentionInheritance(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
@@ -3222,6 +3936,7 @@ func TestNestedMemberReplyUsesDirectParentForMentionInheritance(t *testing.T) {
 
 	assigneeAgent := createHandlerTestAgent(t, "Nested Mention Assignee", nil)
 	mentionedAgent := createHandlerTestAgent(t, "Nested Mention Target", nil)
+	parentAgent := createHandlerTestAgent(t, "Nested Direct Parent", nil)
 
 	var number int
 	if err := testPool.QueryRow(ctx, `
@@ -3288,7 +4003,7 @@ func TestNestedMemberReplyUsesDirectParentForMentionInheritance(t *testing.T) {
 		INSERT INTO comment (workspace_id, issue_id, author_type, author_id, content, parent_id)
 		VALUES ($1, $2, 'agent', $3, $4, $5)
 		RETURNING id
-	`, testWorkspaceID, issueID, mentionedAgent, "looks like redirect config", root.ID).Scan(&directParentID); err != nil {
+	`, testWorkspaceID, issueID, parentAgent, "looks like redirect config", root.ID).Scan(&directParentID); err != nil {
 		t.Fatalf("insert direct parent reply: %v", err)
 	}
 
@@ -3302,12 +4017,16 @@ func TestNestedMemberReplyUsesDirectParentForMentionInheritance(t *testing.T) {
 	if got := countQueued(mentionedAgent); got != 0 {
 		t.Fatalf("plain nested reply must not inherit root mention from non-direct parent; got %d queued tasks", got)
 	}
+	if got := countQueued(parentAgent); got != 1 {
+		t.Fatalf("plain nested reply should route to direct agent parent; got %d queued tasks", got)
+	}
 }
 
-// TestNestedMemberReplyUsesDirectParentForAssigneeParticipation is the
-// regression for treating any prior agent reply in the root thread as direct
-// participation in a nested human sub-thread.
-func TestNestedMemberReplyUsesDirectParentForAssigneeParticipation(t *testing.T) {
+// TestNestedMemberReplyUnderMemberSkipsAssigneeFallback verifies that a nested
+// reply whose direct parent is human-owned neither routes to a sibling agent
+// reply nor falls back to the issue assignee. A sibling agent comment alone
+// does not establish a conversation owner for the member-authored root.
+func TestNestedMemberReplyUnderMemberSkipsAssigneeFallback(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -3396,7 +4115,7 @@ func TestNestedMemberReplyUsesDirectParentForAssigneeParticipation(t *testing.T)
 		t.Fatalf("stored nested reply parent_id should keep direct parent %s, got %v", humanParentID, nested.ParentID)
 	}
 	if got := countAssigneeQueued(); got != 0 {
-		t.Fatalf("plain nested human reply must not wake assignee just because assignee replied elsewhere under root; got %d queued tasks", got)
+		t.Fatalf("plain nested human reply queued assignee tasks = %d, want 0", got)
 	}
 }
 
@@ -3468,5 +4187,191 @@ func TestAgentExplicitMentionStillTriggers(t *testing.T) {
 	}
 	if got := countTasks(agentA); got != 0 {
 		t.Fatalf("expected 0 tasks for Agent A (no self-trigger on own mention), got %d", got)
+	}
+}
+
+func TestCreateSkillSkipsSkillMdFile(t *testing.T) {
+	if testPool == nil {
+		t.Skip("no database available")
+	}
+
+	req := newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/skills", CreateSkillRequest{
+		Name:    "test-skill-create-skip-skillmd",
+		Content: "# SKILL.md content",
+		Files: []CreateSkillFileRequest{
+			{Path: "README.md", Content: "readme"},
+			{Path: "SKILL.md", Content: "should be skipped"},
+			{Path: "helper.go", Content: "package main"},
+		},
+	})
+	rec := httptest.NewRecorder()
+	testHandler.CreateSkill(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp SkillWithFilesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+
+	// Should only have README.md and helper.go, not SKILL.md
+	if len(resp.Files) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(resp.Files))
+	}
+	for _, f := range resp.Files {
+		if strings.EqualFold(f.Path, "SKILL.md") {
+			t.Fatalf("SKILL.md should not be in response files")
+		}
+	}
+
+	// Verify DB state directly
+	ctx := context.Background()
+	rows, err := testPool.Query(ctx, "SELECT path FROM skill_file WHERE skill_id = $1", resp.ID)
+	if err != nil {
+		t.Fatalf("query skill_file: %v", err)
+	}
+	defer rows.Close()
+
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			t.Fatalf("scan path: %v", err)
+		}
+		paths = append(paths, p)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("expected 2 rows in skill_file, got %d", len(paths))
+	}
+	for _, p := range paths {
+		if strings.EqualFold(p, "SKILL.md") {
+			t.Fatalf("SKILL.md should not be stored in skill_file")
+		}
+	}
+}
+
+func TestUpdateSkillSkipsSkillMdFile(t *testing.T) {
+	if testPool == nil {
+		t.Skip("no database available")
+	}
+
+	// Create a skill first
+	req := newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/skills", CreateSkillRequest{
+		Name:    "test-skill-update-skip-skillmd",
+		Content: "# SKILL.md content",
+		Files: []CreateSkillFileRequest{
+			{Path: "README.md", Content: "readme"},
+		},
+	})
+	rec := httptest.NewRecorder()
+	testHandler.CreateSkill(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create skill: expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var createResp SkillWithFilesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &createResp); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+
+	// Update with SKILL.md in files
+	updateReq := newRequest(http.MethodPut, "/api/skills/"+createResp.ID, UpdateSkillRequest{
+		Name:    strPtr("updated-name"),
+		Content: strPtr("updated content"),
+		Files: []CreateSkillFileRequest{
+			{Path: "README.md", Content: "updated readme"},
+			{Path: "SKILL.md", Content: "should be skipped"},
+			{Path: "new.go", Content: "package main"},
+		},
+	})
+	updateReq = withURLParam(updateReq, "id", createResp.ID)
+	updateRec := httptest.NewRecorder()
+	testHandler.UpdateSkill(updateRec, updateReq)
+
+	if updateRec.Code != http.StatusOK {
+		t.Fatalf("update skill: expected 200, got %d: %s", updateRec.Code, updateRec.Body.String())
+	}
+
+	var updateResp SkillWithFilesResponse
+	if err := json.Unmarshal(updateRec.Body.Bytes(), &updateResp); err != nil {
+		t.Fatalf("unmarshal update response: %v", err)
+	}
+
+	if len(updateResp.Files) != 2 {
+		t.Fatalf("expected 2 files after update, got %d", len(updateResp.Files))
+	}
+	for _, f := range updateResp.Files {
+		if strings.EqualFold(f.Path, "SKILL.md") {
+			t.Fatalf("SKILL.md should not be in updated response files")
+		}
+	}
+
+	// Verify DB state
+	ctx := context.Background()
+	rows, err := testPool.Query(ctx, "SELECT path FROM skill_file WHERE skill_id = $1", createResp.ID)
+	if err != nil {
+		t.Fatalf("query skill_file: %v", err)
+	}
+	defer rows.Close()
+
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			t.Fatalf("scan path: %v", err)
+		}
+		paths = append(paths, p)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("expected 2 rows in skill_file after update, got %d", len(paths))
+	}
+	for _, p := range paths {
+		if strings.EqualFold(p, "SKILL.md") {
+			t.Fatalf("SKILL.md should not be stored in skill_file after update")
+		}
+	}
+}
+
+func strPtr(s string) *string {
+	return &s
+}
+
+func TestUpsertSkillFileRejectsSkillMd(t *testing.T) {
+	if testPool == nil {
+		t.Skip("no database available")
+	}
+
+	// Create a skill first
+	req := newRequest(http.MethodPost, "/api/workspaces/"+testWorkspaceID+"/skills", CreateSkillRequest{
+		Name:    "test-skill-upsert-reject-skillmd",
+		Content: "# SKILL.md content",
+	})
+	rec := httptest.NewRecorder()
+	testHandler.CreateSkill(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create skill: expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var createResp SkillWithFilesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &createResp); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+
+	// Try to upsert SKILL.md
+	upsertReq := newRequest(http.MethodPut, "/api/skills/"+createResp.ID+"/files", CreateSkillFileRequest{
+		Path:    "SKILL.md",
+		Content: "should be rejected",
+	})
+	upsertReq = withURLParam(upsertReq, "id", createResp.ID)
+	upsertRec := httptest.NewRecorder()
+	testHandler.UpsertSkillFile(upsertRec, upsertReq)
+
+	if upsertRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", upsertRec.Code, upsertRec.Body.String())
+	}
+	if !strings.Contains(upsertRec.Body.String(), "SKILL.md is reserved") {
+		t.Fatalf("expected error message about reserved SKILL.md, got: %s", upsertRec.Body.String())
 	}
 }

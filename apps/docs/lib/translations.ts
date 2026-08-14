@@ -28,6 +28,18 @@ export const uiTranslations: Partial<Record<Lang, Partial<Translations>>> = {
     chooseTheme: "테마 변경",
     editOnGithub: "GitHub에서 편집",
   },
+  ja: {
+    search: "検索",
+    searchNoResult: "結果が見つかりません",
+    toc: "このページの内容",
+    tocNoHeadings: "見出しなし",
+    lastUpdate: "最終更新",
+    chooseLanguage: "言語を選択",
+    nextPage: "次のページ",
+    previousPage: "前のページ",
+    chooseTheme: "テーマを変更",
+    editOnGithub: "GitHub で編集",
+  },
 };
 
 // Display name shown in the LanguageToggle dropdown.
@@ -35,6 +47,7 @@ export const localeLabels: Record<Lang, string> = {
   en: "English",
   zh: "简体中文",
   ko: "한국어",
+  ja: "日本語",
 };
 
 // Copy for the welcome page (Hero + Byline). Pages are translated as MDX;
@@ -44,18 +57,24 @@ export const homeCopy = {
     eyebrow: "Multica Docs",
     titleLead: "Humans and agents,",
     titleAccent: "in one place.",
-    byline: ["Getting started", "Updated April 2026", "6 min read"],
+    byline: ["Getting started", "Updated July 2026", "2 min read"],
   },
   zh: {
     eyebrow: "Multica 文档",
-    titleLead: "人与智能体，",
-    titleAccent: "共处一方。",
-    byline: ["开始使用", "2026 年 4 月更新", "阅读约 6 分钟"],
+    titleLead: "Multica 是人类与 AI 智能体",
+    titleAccent: "共同工作的地方。",
+    byline: ["开始使用", "2026 年 7 月更新", "阅读约 2 分钟"],
   },
   ko: {
     eyebrow: "Multica 문서",
     titleLead: "사람과 에이전트,",
     titleAccent: "한곳에서.",
-    byline: ["시작하기", "2026년 4월 업데이트", "약 6분 읽기"],
+    byline: ["시작하기", "2026년 7월 업데이트", "약 2분 분량"],
+  },
+  ja: {
+    eyebrow: "Multica ドキュメント",
+    titleLead: "人とエージェントが、",
+    titleAccent: "一つの場所に。",
+    byline: ["はじめに", "2026年7月更新", "約2分で読めます"],
   },
 } as const satisfies Record<Lang, unknown>;

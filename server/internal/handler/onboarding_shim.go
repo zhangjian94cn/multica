@@ -1,19 +1,18 @@
 // onboarding_shim.go — DEPRECATED endpoints kept alive for desktop < v3.
 //
-// Background: v3 moved Helper-agent creation and starter-issue seeding to
-// the frontend welcome hook (packages/views/workspace/welcome-after-onboarding.tsx),
-// which calls generic CreateAgent / CreateIssue. Pre-v3 desktop builds
-// however still call BootstrapOnboardingRuntime / BootstrapOnboardingNoRuntime
-// during their onboarding flow. Server-side removal would break those
-// users during the rollout window where v3 server is live but their
-// desktop hasn't auto-updated yet.
+// Background: pre-v3 desktop builds call BootstrapOnboardingRuntime /
+// BootstrapOnboardingNoRuntime during their onboarding flow. Current
+// clients no longer use the runtime bootstrap path; they create only Mika
+// and start the real interactive onboarding chat before completing setup.
+// Removing this endpoint would still break an old installed desktop
+// talking to a newer server.
 //
 // These handlers are intentionally minimal copies of the pre-v3
 // implementation, condensed to inline DB calls (no OnboardingService /
 // WorkspaceContentService layer — that abstraction died with v3). They
 // remain valid until telemetry on the X-Client-Version header confirms
-// every active desktop install is on a v3+ build, at which point this
-// entire file + the two router entries + the 5 tests should be deleted.
+// every active desktop install has aged out, at which point this entire
+// file + the two router entries + the 5 tests should be deleted.
 //
 // DO NOT add features here. DO NOT change behavior. The contract is "what
 // pre-v3 desktop expects".
@@ -33,6 +32,8 @@ import (
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/issueguard"
 	"github.com/multica-ai/multica/server/internal/logger"
+	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
+	"github.com/multica-ai/multica/server/internal/middleware"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -48,9 +49,9 @@ const runtimeBootstrapBodyLimit = 8 * 1024
 const maxStarterPromptLen = 2 * 1024
 
 const (
-	onboardingAssistantName = "Multica Helper"
-	onboardingIssueTitle    = "Start here: learn Multica with Multica Helper"
-	onboardingAgentTemplate = "multica_helper"
+	onboardingAssistantName       = "Multica Helper"
+	onboardingIssueTitle          = "Start here: learn Multica with Multica Helper"
+	onboardingAgentCreationSource = "multica_helper"
 
 	// noRuntimeIssueTitle MUST match the pre-v3 service constant so
 	// LockAndFindActiveDuplicate dedupes correctly across desktop versions.
@@ -63,12 +64,9 @@ const onboardingAssistantAvatarURL = "data:image/svg+xml,%3Csvg xmlns='http://ww
 
 // onboardingAssistantInstructions is the system prompt persisted on every
 // Multica Helper agent created by this shim. Pre-v3 desktop submits a
-// starter prompt from the workspace OnboardingHelperModal; that prompt
+// starter prompt from the historical workspace OnboardingHelperModal; that prompt
 // becomes the issue body, while this constant becomes the agent's identity
-// block in CLAUDE.md / AGENTS.md / GEMINI.md. v3 frontend has its own
-// in-views copy of this string (`packages/views/onboarding/templates/
-// helper-instructions.ts`) — these two must stay in sync until the shim
-// is removed.
+// block in CLAUDE.md / AGENTS.md / GEMINI.md.
 const onboardingAssistantInstructions = `You are Multica Helper, the built-in AI assistant for this Multica workspace. Your role is to help any member use Multica better — answer questions, give advice, and execute workspace operations on their behalf.
 
 ## What Multica is
@@ -191,7 +189,7 @@ func (h *Handler) BootstrapOnboardingRuntime(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if !canUseRuntimeForAgent(member, runtime) {
-		writeError(w, http.StatusForbidden, "this runtime is private; only its owner or a workspace admin can create agents on it")
+		writeError(w, http.StatusForbidden, "this runtime is private; only its owner can create agents on it")
 		return
 	}
 
@@ -306,20 +304,22 @@ func (h *Handler) BootstrapOnboardingRuntime(w http.ResponseWriter, r *http.Requ
 	}
 
 	if assistantCreated {
-		resp := agentToResponse(assistant)
+		resp := h.agentToResponse(assistant)
 		h.publish(protocol.EventAgentCreated, req.WorkspaceID, "member", userID, map[string]any{"agent": resp})
-		h.Analytics.Capture(analytics.AgentCreated(
+		obsmetrics.RecordEvent(h.Analytics, h.Metrics, analytics.AgentCreated(
 			userID, req.WorkspaceID, uuidToString(assistant.ID),
-			runtime.Provider, runtime.RuntimeMode, onboardingAgentTemplate, isFirstAgent,
+			runtime.Provider, runtime.RuntimeMode, onboardingAgentCreationSource, isFirstAgent,
 		))
 	}
 	if issueCreated {
 		prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
 		resp := issueToResponse(issue, prefix)
 		h.publish(protocol.EventIssueCreated, req.WorkspaceID, "member", userID, map[string]any{"issue": resp})
-		h.Analytics.Capture(analytics.IssueCreated(
+		platform, _, _ := middleware.ClientMetadataFromContext(r.Context())
+		obsmetrics.RecordEvent(h.Analytics, h.Metrics, analytics.IssueCreated(
 			userID, req.WorkspaceID, uuidToString(issue.ID),
 			uuidToString(assistant.ID), "", "", analytics.SourceOnboarding,
+			platform,
 		))
 		if h.shouldEnqueueAgentTask(r.Context(), issue) {
 			h.TaskService.EnqueueTaskForIssue(r.Context(), issue)
@@ -330,7 +330,7 @@ func (h *Handler) BootstrapOnboardingRuntime(w http.ResponseWriter, r *http.Requ
 		if updatedUser.OnboardedAt.Valid {
 			onboardedAt = updatedUser.OnboardedAt.Time.UTC().Format("2006-01-02T15:04:05Z07:00")
 		}
-		h.Analytics.Capture(analytics.OnboardingCompleted(
+		obsmetrics.RecordEvent(h.Analytics, h.Metrics, analytics.OnboardingCompleted(
 			userID, req.WorkspaceID, analytics.OnboardingPathFull,
 			onboardedAt, updatedUser.CloudWaitlistEmail.Valid,
 		))
@@ -455,9 +455,11 @@ func (h *Handler) BootstrapOnboardingNoRuntime(w http.ResponseWriter, r *http.Re
 		prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
 		resp := issueToResponse(issue, prefix)
 		h.publish(protocol.EventIssueCreated, req.WorkspaceID, "member", userID, map[string]any{"issue": resp})
-		h.Analytics.Capture(analytics.IssueCreated(
+		platform2, _, _ := middleware.ClientMetadataFromContext(r.Context())
+		obsmetrics.RecordEvent(h.Analytics, h.Metrics, analytics.IssueCreated(
 			userID, req.WorkspaceID, uuidToString(issue.ID),
 			"", "", "", analytics.SourceOnboarding,
+			platform2,
 		))
 	}
 	if firstCompletion {
@@ -465,7 +467,7 @@ func (h *Handler) BootstrapOnboardingNoRuntime(w http.ResponseWriter, r *http.Re
 		if updatedUser.OnboardedAt.Valid {
 			onboardedAt = updatedUser.OnboardedAt.Time.UTC().Format("2006-01-02T15:04:05Z07:00")
 		}
-		h.Analytics.Capture(analytics.OnboardingCompleted(
+		obsmetrics.RecordEvent(h.Analytics, h.Metrics, analytics.OnboardingCompleted(
 			userID, req.WorkspaceID, analytics.OnboardingPathRuntimeSkipped,
 			onboardedAt, updatedUser.CloudWaitlistEmail.Valid,
 		))

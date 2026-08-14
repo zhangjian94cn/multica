@@ -228,7 +228,7 @@ Each hook registers a single `ws.onReconnect(cb)` that invalidates **only the qu
 |---|---|
 | `useInboxRealtime` | `inboxKeys.list(wsId)` |
 | `useMyIssuesRealtime` | `issueKeys.myAll(wsId)` |
-| `useIssueRealtime(id)` | `issueKeys.detail(wsId, id)` + `issueKeys.timeline(wsId, id)` |
+| `useIssueRealtime(id)` | detail + timeline + attachments + active tasks + task history for that issue |
 
 No global "invalidate everything on reconnect" sweep. The fanout would be every screen the user has ever visited in this session refetching simultaneously — wasteful on cellular and prone to rate-limiting the server in low-signal areas where reconnects happen frequently.
 
@@ -394,8 +394,11 @@ Before opening a PR for a new screen / mutation / realtime hook:
 2. API methods → `fetchValidated` / `fetchValidatedWith` (or raw
    `this.fetch` only for writes with no consumed response).
 3. Query key → factory in `data/queries/<feature>.ts`, 3-segment shape.
-4. Mutations → optimistic three-step (snapshot → patch → rollback) +
-   settle invalidate, all keys via factory.
+4. Mutations → optimistic only when the post-state is locally predictable,
+   the user stays on the same screen, failure is rare, and rollback is
+   trivial. When that gate passes, use snapshot → patch → rollback +
+   settle invalidate, all keys via factory. Create/delete/navigate/confirm
+   flows await the server instead.
 5. Realtime → `useWSSubscriptions(setup, deps)`, typed `ws.on<E>()`,
    per-event patching (no global invalidate) when payload carries the
    full object.

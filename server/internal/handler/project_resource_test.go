@@ -1,10 +1,15 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 func TestProjectResourceLifecycle(t *testing.T) {
@@ -31,7 +36,10 @@ func TestProjectResourceLifecycle(t *testing.T) {
 	w = httptest.NewRecorder()
 	req = newRequest("POST", "/api/projects/"+project.ID+"/resources", map[string]any{
 		"resource_type": "github_repo",
-		"resource_ref":  map[string]any{"url": "https://github.com/multica-ai/multica"},
+		"resource_ref": map[string]any{
+			"url": "https://github.com/multica-ai/multica",
+			"ref": "release/v2",
+		},
 	})
 	req = withURLParam(req, "id", project.ID)
 	testHandler.CreateProjectResource(w, req)
@@ -47,12 +55,16 @@ func TestProjectResourceLifecycle(t *testing.T) {
 	}
 	var ref struct {
 		URL string `json:"url"`
+		Ref string `json:"ref"`
 	}
 	if err := json.Unmarshal(created.ResourceRef, &ref); err != nil {
 		t.Fatalf("decode resource_ref: %v", err)
 	}
 	if ref.URL != "https://github.com/multica-ai/multica" {
 		t.Errorf("created.ResourceRef.url = %q", ref.URL)
+	}
+	if ref.Ref != "release/v2" {
+		t.Errorf("created.ResourceRef.ref = %q, want release/v2", ref.Ref)
 	}
 
 	// Listing must include the new resource.
@@ -81,7 +93,10 @@ func TestProjectResourceLifecycle(t *testing.T) {
 	w = httptest.NewRecorder()
 	req = newRequest("POST", "/api/projects/"+project.ID+"/resources", map[string]any{
 		"resource_type": "github_repo",
-		"resource_ref":  map[string]any{"url": "https://github.com/multica-ai/multica"},
+		"resource_ref": map[string]any{
+			"url": "https://github.com/multica-ai/multica",
+			"ref": "release/v2",
+		},
 	})
 	req = withURLParam(req, "id", project.ID)
 	testHandler.CreateProjectResource(w, req)
@@ -566,8 +581,31 @@ func TestProjectResourceCountBreadcrumb(t *testing.T) {
 		t.Fatalf("project %s not found in ListProjects response", project.ID)
 	}
 
+	var number int
+	if err := testPool.QueryRow(context.Background(), `
+		UPDATE workspace
+		SET issue_counter = GREATEST(issue_counter, (SELECT COALESCE(MAX(number), 0) FROM issue WHERE workspace_id = $1)) + 1
+		WHERE id = $1 RETURNING issue_counter
+	`, testWorkspaceID).Scan(&number); err != nil {
+		t.Fatalf("next issue number: %v", err)
+	}
+	var issueID string
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO issue (
+			workspace_id, creator_type, creator_id, title, status, priority,
+			project_id, number, position
+		)
+		VALUES ($1, 'member', $2, 'Project update stats breadcrumb', 'done', 'none', $3, $4, 0)
+		RETURNING id
+	`, testWorkspaceID, testUserID, project.ID, number).Scan(&issueID); err != nil {
+		t.Fatalf("create project issue: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID)
+	})
+
 	// UpdateProject must preserve the breadcrumb. A title-only PUT used to
-	// reset resource_count to 0 because UpdateProject didn't reload the count.
+	// reset derived counts to 0 because UpdateProject didn't reload them.
 	w = httptest.NewRecorder()
 	req = newRequest("PUT", "/api/projects/"+project.ID, map[string]any{
 		"title": "Resource count breadcrumb (updated)",
@@ -583,6 +621,9 @@ func TestProjectResourceCountBreadcrumb(t *testing.T) {
 	}
 	if updated.ResourceCount != 1 {
 		t.Errorf("UpdateProject ResourceCount = %d, want 1", updated.ResourceCount)
+	}
+	if updated.IssueCount != 1 || updated.DoneCount != 1 {
+		t.Errorf("UpdateProject issue stats = %d/%d, want 1/1", updated.DoneCount, updated.IssueCount)
 	}
 }
 
@@ -1063,5 +1104,138 @@ func TestCreateProjectBundledLocalDirectoryDaemonConflict(t *testing.T) {
 	}()
 	if len(resp.Resources) != 2 {
 		t.Errorf("per-daemon bundle: expected 2 resources, got %d", len(resp.Resources))
+	}
+}
+
+// execution_mode selects between the historical exclusive in-place run and
+// worktree mode. It is validated at the API boundary so a typo is caught at
+// save time; a daemon new enough to know the field refuses unknown values
+// rather than falling back to in_place, so the two checks together keep a
+// mistyped mode from ever running.
+func TestValidateLocalDirectoryRefExecutionMode(t *testing.T) {
+	accepted := []struct {
+		name string
+		mode string
+		want string
+	}{
+		{"absent means in_place", "", ""},
+		{"explicit in_place", "in_place", "in_place"},
+		{"worktree", "worktree", "worktree"},
+		{"surrounding whitespace is trimmed", "  worktree  ", "worktree"},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			ref := map[string]any{"local_path": "/Users/foo/work", "daemon_id": "d1"}
+			if tc.mode != "" {
+				ref["execution_mode"] = tc.mode
+			}
+			raw, err := json.Marshal(ref)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			out, err := validateLocalDirectoryRef(raw)
+			if err != nil {
+				t.Fatalf("validateLocalDirectoryRef: %v", err)
+			}
+			var got localDirectoryRef
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatalf("unmarshal normalized ref: %v", err)
+			}
+			if got.ExecutionMode != tc.want {
+				t.Errorf("ExecutionMode = %q, want %q", got.ExecutionMode, tc.want)
+			}
+		})
+	}
+
+	rejected := []string{"snapshot", "WORKTREE", "in-place", "true"}
+	for _, mode := range rejected {
+		t.Run("rejects "+mode, func(t *testing.T) {
+			raw, err := json.Marshal(map[string]any{
+				"local_path":     "/Users/foo/work",
+				"daemon_id":      "d1",
+				"execution_mode": mode,
+			})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if _, err := validateLocalDirectoryRef(raw); err == nil {
+				t.Errorf("execution_mode %q was accepted, want a validation error", mode)
+			}
+		})
+	}
+}
+
+// latestDaemonCLIVersion feeds the worktree-mode save gate: an old daemon
+// json-skips execution_mode and would run tasks in place, so the gate has to
+// read the version of the binary actually running on the machine — the
+// freshest version-bearing row for that daemon_id, never a stale sibling row.
+func TestLatestDaemonCLIVersion(t *testing.T) {
+	row := func(daemonID, version string, seen time.Time) db.AgentRuntime {
+		rt := db.AgentRuntime{
+			DaemonID:   pgtype.Text{String: daemonID, Valid: daemonID != ""},
+			LastSeenAt: pgtype.Timestamptz{Time: seen, Valid: !seen.IsZero()},
+		}
+		if version != "" {
+			rt.Metadata = []byte(`{"cli_version":"` + version + `"}`)
+		}
+		return rt
+	}
+	base := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name     string
+		runtimes []db.AgentRuntime
+		daemonID string
+		want     string
+	}{
+		{
+			name:     "no rows at all",
+			runtimes: nil,
+			daemonID: "d1",
+			want:     "",
+		},
+		{
+			name:     "only other daemons",
+			runtimes: []db.AgentRuntime{row("d2", "0.9.9", base)},
+			daemonID: "d1",
+			want:     "",
+		},
+		{
+			name:     "single match",
+			runtimes: []db.AgentRuntime{row("d1", "0.4.24", base)},
+			daemonID: "d1",
+			want:     "0.4.24",
+		},
+		{
+			name: "freshest row wins regardless of order",
+			runtimes: []db.AgentRuntime{
+				row("d1", "0.4.30", base.Add(2*time.Hour)),
+				row("d1", "0.4.20", base),
+			},
+			daemonID: "d1",
+			want:     "0.4.30",
+		},
+		{
+			name: "stale-but-fresher row without a version does not mask an older versioned row",
+			runtimes: []db.AgentRuntime{
+				row("d1", "", base.Add(2*time.Hour)),
+				row("d1", "0.4.24", base),
+			},
+			daemonID: "d1",
+			want:     "0.4.24",
+		},
+		{
+			name:     "match with no version anywhere",
+			runtimes: []db.AgentRuntime{row("d1", "", base)},
+			daemonID: "d1",
+			want:     "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := latestDaemonCLIVersion(tc.runtimes, tc.daemonID); got != tc.want {
+				t.Errorf("latestDaemonCLIVersion = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
